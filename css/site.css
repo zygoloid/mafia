@@ -1,0 +1,107 @@
+/* general, tag-specific, class-indep */
+body
+{
+	background-color: #df4f2f;
+	/*old-background-color: #ff9f4f;*/
+	background-image: none;
+	color: #6f0000;
+	font-family: sans-serif;
+	padding: 10px;
+}
+
+h1
+{
+	padding-left: 10px;
+	padding-right: 10px;
+	padding-top: 5px;
+	padding-bottom: 5px;
+	background-color: #ef8f3f;
+	/*old-background-color: #ff9f4f;*/
+	text-align: center;
+	color: #7f3f3f;
+}
+
+div
+{
+	padding-left: 10px;
+	padding-right: 10px;
+	padding-top: 5px;
+	padding-bottom: 5px;
+	background-color: #ff9f4f;
+}
+
+table
+{
+	border: none;
+	color: #6f0000;
+}
+
+img
+{
+	border-width: 0
+}
+
+a:visited { color: #9f1f1f; }
+a:link    { color: #bf2f2f; }
+a:hover   { color: #df3f3f; }
+
+/* navigation bar on top of all pages */
+
+div.navbar
+{
+	background-color: #ffffff;
+	margin-left: 0px;
+	margin-right: 0px;
+	margin-top: 0px;
+	color: #6f0000;
+}
+
+/* news items */
+.newshead { margin-left: -5px; font-size: smaller; color: #6f1f1f; }
+.newsdate { font-style: italic; }
+.newsuser { font-style: italic; }
+.newsbody { display: block; }
+
+/* for games/mafia */
+.mafiaPlayerName, .mafiaPlayerDetails, .mafiaPlayerActions
+{
+	height: 100%;
+	background-color: #f79747;
+	padding: 5px;
+}
+
+.mafiaPlayerName
+{
+	text-align: center;
+}
+
+.mafiaPlayerDetails
+{
+	width: 100%;
+}
+
+.mafiaPlayerActions
+{
+	text-align: right;
+}
+
+/* for mass */
+.annotatedtimelinetable *
+{
+  padding-left: 0px;
+  padding-right: 0px;
+  padding-top: 0px;
+  padding-bottom: 0px;
+  background-color: inherit;
+}
+
+.chartclient-annotation-sel
+{
+  background-color: #ef8f3f !important;
+}
+
+.chartclient-annotation-date
+{
+  color: #7f3f3f !important;
+}
+

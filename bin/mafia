@@ -1,0 +1,648 @@
+#! /usr/bin/env python
+
+from __future__ import generators
+import sys
+import cPickle as pickle
+import re
+import random
+
+MAFIA_DATA_DIR = '/var/www/sites/metafoo.co.uk/data/mafia/'
+MAFIA_LOCK_FILE = MAFIA_DATA_DIR + '.lockfile'
+
+def error(err):
+	print >> sys.stderr, err
+	sys.exit(1)
+
+def errorInvalidArgument(descr = ''):
+	error("error: invalid argument (%1s)" % descr)
+
+class Phase(object):
+	def __init__(self, game):
+		self.game = game
+	def begin(self):
+		for i in self.game.groups:
+			i.postChangePhase( self )
+	def end(self):
+		for i in self.game.groups:
+			i.preChangePhase( self )
+
+class DayPhase(Phase):
+	def __init__(self, game):
+		super(DayPhase, self).__init__(game)
+		self.name = 'day'
+	def begin(self):
+		super(DayPhase,self).begin()
+	def end(self):
+		super(DayPhase,self).end()
+
+class NightPhase(Phase):
+	def __init__(self, game):
+		super(NightPhase, self).__init__(game)
+		self.name = 'night'
+	def begin(self):
+		super(NightPhase,self).begin()
+	def end(self):
+		self.killed = []
+		self.saved = []
+		super(NightPhase,self).end()
+		for i in self.killed:
+			if i not in self.saved:
+				i.die('murdered', self.game)
+		del self.killed
+		del self.saved
+
+phases = { 'day': DayPhase, 'night': NightPhase }
+
+def phaseStringToPhase(ps):
+	phaseList = phases.keys()
+	for i in range(len(phaseList)):
+		if phaseList[i] == ps:
+			return i
+	return -1
+
+def inMafia(player):
+	for facet in player.facets:
+		if isinstance(facet,MafiaMemberFacet): return facet.mafia
+	return False
+
+def voteWinner( votes ):
+	votes.sort(lambda a,b:cmp(a.target,b.target))
+	mostVotes, mostVotesEntries = -1, []
+	currVotes, currVotesEntry = 0, None
+	for i in votes:
+		if i.target != currVotesEntry:
+			currVotes, currVotesEntry = 1, i.target
+		else:
+			currVotes = currVotes + 1
+		if currVotes == mostVotes:
+			mostVotesEntries.append( currVotesEntry )
+		elif currVotes > mostVotes:
+			mostVotes, mostVotesEntries = currVotes, [ currVotesEntry ]
+	return mostVotes, mostVotesEntries
+
+class Group(object):
+	def preChangePhase(self, old):
+		pass
+	def postChangePhase(self, new):
+		pass
+	def __getMembers(self):
+		for i in self.facets:
+			yield i.player
+	members = property(__getMembers)
+
+class LynchMob(Group):
+	def __init__(self, facets):
+		self.facets = facets
+	def postChangePhase(self, new):
+		if new.name == 'day':
+			self.votePool = VotePool()
+			for i in self.facets:
+				i.vote = self.votePool.newVote(i.player)
+	def preChangePhase(self, old):
+		if old.name == 'day':
+			votes = self.votePool.votes
+			votesFor, lynched = voteWinner( [ votes[v] for v in votes.keys() if not v.dead and votes[v].target != None ] )
+			if len(lynched) > 0:
+				random.choice( lynched ).die( 'lynched', old.game )
+			old.__votes = self.votePool
+			self.votePool = None
+			for i in self.facets:
+				i.vote = None
+
+class Mafia(Group):
+	def __init__(self, name):
+		self.name = name
+		self.votePool = None
+	def postChangePhase(self, new):
+		if self.votePool == None:
+			self.votePool = VotePool()
+			for i in self.facets:
+				i.vote = self.votePool.newVote(i.player)
+	def preChangePhase(self, old):
+		if old.name == 'night':
+			if '_Mafia__votes' not in old.__dict__:
+				old.__votes = {}
+			old.__votes[self.name] = self.votePool
+			votes = self.votePool.votes
+			votesFor, killed = voteWinner( [ votes[v] for v in votes.keys() if not v.dead and votes[v].target != None and not votes[v].target.dead ] )
+			if len(killed) == 0:
+				killed = [ player for player in old.game.players.values() if not player.dead ]
+			old.killed.append( random.choice( killed ) )
+			self.votePool = None
+			for i in self.facets:
+				i.vote = None
+
+class PoliceForce(Group):
+	def __init__(self, name):
+		self.name = name
+		self.votePool = None
+		self.checkedPeople = {}
+	def checked(self, player):
+		return player.name in self.checkedPeople
+	def canCheck(self, asker, player):
+		return not asker.dead and not player.dead and not self.checked(player) and not player in self.members
+	def postChangePhase(self, new):
+		if self.votePool == None:
+			self.votePool = VotePool()
+			for i in self.facets:
+				i.vote = self.votePool.newVote(i.player)
+	def preChangePhase(self, old):
+		if old.name == 'night':
+			if '_PoliceForce__votes' not in old.__dict__:
+				old.__votes = {}
+			old.__votes[self.name] = self.votePool
+			votes = self.votePool.votes
+			votesFor, checked = voteWinner( [ votes[v] for v in votes.keys() if not v.dead and votes[v].target != None and self.canCheck( v, votes[v].target ) ] )
+			if len(checked) > 0:
+				self.checkedPeople[ random.choice( checked ).name ] = ( old.game.day, old.game.phase )
+			self.votePool = None
+			for i in self.facets:
+				i.vote = None
+
+class PlayerFacet(object):
+	def allInfo(self):
+		return []
+	def meInfo(self, asker):
+		return []
+	def themInfo(self, player):
+		return []
+	def actionsOn(self, player):
+		return []
+	def action(self, player, act):
+		return False
+
+class VotingFacet(PlayerFacet):
+	def __init__(self, name):
+		self.vote = None
+		self.name = name
+	def meInfo(self, asker):
+		if not self.showVoteTo(asker) or self.player.dead or self.vote == None: return []
+		name = ''
+		if self.vote.target:
+			name = self.vote.target.name
+		return [ 'they_vote_' + self.name + ' ' + name ]
+	def themInfo(self, player):
+		if self.vote != None and player == self.vote.target and not self.player.dead:
+			return [ 'you_vote_' + self.name + ' ' + player.name ]
+		return []
+	def actionsOn(self, player):
+		if self.vote == None or player.dead or self.player.dead:
+			return []
+		if player == self.vote.target:
+			return [ 'unvote_' + self.name ]
+		return [ 'vote_' + self.name ]
+	def action(self, player, act):
+		if self.vote == None or player.dead or self.player.dead:
+			return False
+		if player == self.vote.target and act == 'unvote_' + self.name:
+			self.vote.target = None
+			return True
+		if player != self.vote.target and act == 'vote_' + self.name:
+			self.vote.target = player
+			return True
+		return False
+
+class LyncherFacet(VotingFacet):
+	def __init__(self):
+		super(LyncherFacet, self).__init__('lynch')
+	def showVoteTo(self, asker):
+		return True
+
+class MafiaMemberFacet(VotingFacet):
+	def __init__(self, mafia):
+		super(MafiaMemberFacet, self).__init__('murder')
+		self.mafia = mafia
+	def isInMafia(self, player):
+		return player in self.mafia.members
+	showVoteTo = isInMafia
+	def allInfo(self):
+		return [ 'mafia ' + self.mafia.name ]
+	def themInfo(self, player):
+		result = super(MafiaMemberFacet, self).themInfo(player)
+		if self.isInMafia(player):
+			result.extend( self.allInfo() )
+		return result
+
+class DoctorFacet(VotingFacet):
+	def __init__(self):
+		super(DoctorFacet, self).__init__('save')
+	def showVoteTo(self, player):
+		return player == self.player
+	def allInfo(self):
+		return [ 'doctor' ]
+	def themInfo(self, player):
+		if player == self.player: return self.allInfo()
+		return []
+	def postChangePhase(self, new):
+		if self.vote == None:
+			self.vote = Vote()
+	def preChangePhase(self, old):
+		if old.name == 'night':
+			if '_DoctorFacet__votes' not in old.__dict__:
+				old.__votes = {}
+			old.__votes[self.player.name] = self.vote
+			if not self.player.dead:
+				old.saved.append(self.vote.target)
+			self.vote = None
+
+class DetectiveFacet(VotingFacet):
+	def __init__(self, force):
+		super(DetectiveFacet, self).__init__('investigate')
+		self.force = force
+	def isInForce(self, other):
+		return other in self.force.members
+	showVoteTo = isInForce
+	def allInfo(self):
+		return [ 'force ' + self.force.name ]
+	def themInfo(self, player):
+		result = super(DetectiveFacet, self).themInfo(player)
+		if self.isInForce(player):
+			result.extend( self.allInfo() )
+		if self.force.checked(player):
+			if inMafia(player):
+				result.append( 'checked_inmafia' )
+			else:
+				result.append( 'checked_notinmafia' )
+		return result
+	def actionsOn(self, player):
+		if self.force.canCheck(self.player, player):
+			return super(DetectiveFacet, self).actionsOn(player)
+		return []
+	def action(self, player, act):
+		if self.force.canCheck(self.player, player):
+			return super(DetectiveFacet, self).action(player, act)
+
+class Vote:
+	def __init__(self):
+		self.target = None
+
+class VotePool(object):
+	def __init__(self):
+		self.votes = {}
+	def newVote(self, whose):
+		vote = Vote()
+		self.votes[whose] = vote
+		return vote
+
+def accumulate( objs, function ):
+	result = []
+	for i in objs:
+		result.extend(function(i))
+	return result
+
+class Player(object):
+	def __init__(self, name, facets):
+		self.name = name
+		self.dead = False
+		self.facets = facets
+		for i in self.facets: i.player = self
+	def die(self, deathType, game):
+		self.dead = True
+		self.deathType = deathType
+		self.died = ( game.day, game.phase )
+		game.playerDied( self )
+	# info to display once the game is over
+	def allInfo(self):
+		result = accumulate(self.facets, lambda x:x.allInfo())
+		if len(self.facets) == 1:
+			result.append( 'townsperson' )
+		return result
+	# info to display when asker asks
+	def meInfo(self, asker):
+		result = accumulate(self.facets, lambda x:x.meInfo(asker))
+		if len(self.facets) == 1 and asker == self:
+			result.append( 'townsperson' )
+		return result
+	# extra information we know about player
+	def themInfo(self, player):
+		return accumulate(self.facets, lambda x:x.themInfo(player))
+	# what we can do to player
+	def actionsOn(self, player):
+		return accumulate(self.facets, lambda x:x.actionsOn(player))
+	# do something to player
+	def action(self, player, act):
+		for i in self.facets:
+			if i.action(player, act):
+				return
+		errorInvalidArgument()
+
+class MafiaGameLock:
+	def __init__(self):
+		self.file = file(MAFIA_LOCK_FILE,'w')
+		import fcntl
+		fcntl.flock(self.file, fcntl.LOCK_EX)
+
+class MafiaGame:
+	def __init__(self, players, groups, startPhase = 0):
+		self.players = players
+		self.groups = groups
+		self.day = 1
+		self.phase = startPhase
+		self.thisRound = phases[phases.keys()[self.phase]](self)
+		self.rounds = { (self.day, self.phase): self.thisRound }
+		self.thisRound.begin()
+		self.over = False
+	
+	def __gameFile( gameId, access = 'r' ):
+		return file(MAFIA_DATA_DIR + gameId, access)
+	__gameFile = staticmethod(__gameFile)
+	
+	def load(gameId):
+		savedFile = MafiaGame.__gameFile( gameId )
+		return pickle.load( savedFile )
+	load = staticmethod(load)
+	
+	def save(self, gameId):
+		targetFile = MafiaGame.__gameFile( gameId, 'w' )
+		pickle.dump( self, targetFile )
+	
+	def getPlayer(self, name):
+		if name in self.players:
+			return self.players[name]
+		return Player('',[])
+	
+	# called from Player.die
+	def playerDied(self, player):
+		playersLeft = {}
+		for p in self.players.values():
+			if not p.dead:
+				mafia = inMafia(p)
+				playersLeft[mafia] = playersLeft.get(mafia, 0) + 1
+		mafiasLeft = [team for team in playersLeft.keys() if team]
+		if len(playersLeft) == 0:
+			self.over = True
+			self.winner = 'none'
+		if len(playersLeft) == 1 or (len(mafiasLeft) == 1 and playersLeft[mafiasLeft[0]] >= playersLeft[False]):
+			self.over = True
+			self.winner = (mafiasLeft and mafiasLeft[0].name or 'townsfolk')
+
+	def nextRound(self):
+		if self.over: return
+		self.thisRound.end()
+		if self.phase < len(phases) - 1:
+			self.phase = self.phase + 1
+		else:
+			self.day = self.day + 1
+			self.phase = 0
+		self.thisRound = phases[phases.keys()[self.phase]](self)
+		self.rounds[ (self.day, self.phase) ] = self.thisRound
+		self.thisRound.begin()
+
+def isUserId(id):
+	return re.match('^[a-z]+$', id) != None	
+def isMafiaId(id):
+	return re.match('^[0-9A-Za-z]+$', id) != None
+def isInteger(i):
+	return re.match('^[0-9]+$', i) != None
+
+def createGame(options, args):
+	lock = MafiaGameLock()
+	numPlayers = len(args)
+	if numPlayers == 0:
+		errorInvalidArgument()
+	for i in args:
+		if not isUserId(i):
+			errorInvalidArgument()
+	def getValue(name, default):
+		if name in options: return options[name]
+		return default
+	mafiaMembers = getValue('mafiamembers',1)
+	numMafias = getValue('mafias',1)
+	doctors = getValue('doctors',0)
+	policeForces = getValue('policeforces',1)
+	detectives = getValue('detectives',0)
+	numUnassigned = getValue('unassigned',0)
+	numSpecial = mafiaMembers * numMafias + doctors + policeForces * detectives
+	if numSpecial > numPlayers + numUnassigned:
+		errorInvalidArgument('not enough players for roles')
+	
+	roles = [ (1,j) for i in range(mafiaMembers) for j in range(numMafias) ]
+	roles.extend( [ (2,0) for i in range(doctors) ] )
+	roles.extend( [ (3,j) for i in range(detectives) for j in range(policeForces) ] )
+	roles.extend( [ (0,0) for i in range(numPlayers + numUnassigned - numSpecial) ] )
+	
+	random.shuffle(roles)
+	
+	players = {}
+	teams = []
+	
+	lynchFacets = []
+	
+	def createPlayer(n, extra = None):
+		facets = [ LyncherFacet() ]
+		lynchFacets.append( facets[0] )
+		if extra != None:
+			facets.append( extra )
+		new = Player(args[n], facets)
+		players[args[n]] = new
+		return new
+	
+	# create mafias
+	for maf in range(numMafias):
+		mafia = Mafia('mafia' + `maf`)
+		facets = []
+		for j in [ i for i in range(numPlayers) if roles[i] == (1,maf) ]:
+			facet = MafiaMemberFacet(mafia)
+			createPlayer(j, facet)
+			facets.append(facet)
+		mafia.facets = facets
+		teams.append(mafia)
+	# create doctors
+	for j in [ i for i in range(numPlayers) if roles[i] == (2,0) ]:
+		facet = DoctorFacet()
+		teams.append(facet)
+		createPlayer(j, facet)
+	# create police forces
+	for maf in range(policeForces):
+		force = PoliceForce('force' + `maf`)
+		facets = []
+		for j in [ i for i in range(numPlayers) if roles[i] == (3,maf) ]:
+			facet = DetectiveFacet(force)
+			createPlayer(j, facet)
+			facets.append(facet)
+		force.facets = facets
+		teams.append(force)
+	# create townsfolk
+	for j in [ i for i in range(numPlayers) if roles[i] == (0,0) ]:
+		createPlayer(j)
+	
+	teams.append( LynchMob(lynchFacets) )
+	
+	game = MafiaGame( players, teams )
+	game.save( options['gameid'] )
+
+def listPlayers(options, args):
+	game = MafiaGame.load( options['gameid'] )
+	for player in game.players.values():
+		print player.name
+
+def printRound(options, args):
+	game = MafiaGame.load( options['gameid'] )
+	print game.day
+	print phases.keys()[game.phase]
+
+def printPlayerDetails(options, args):
+	game = MafiaGame.load( options['gameid'] )
+	if len(args) != 1 or not isUserId(args[0]):
+		errorInvalidArgument()
+	if not args[0] in game.players:
+		errorInvalidArgument('no such player')
+	
+	player = game.players[ args[0] ]
+	asker = game.getPlayer( options['uid'] )
+	
+	if player.dead:
+		print player.deathType
+	
+	if game.over:
+		for i in player.allInfo():
+			print i
+		return
+	
+	for i in player.meInfo( asker ):
+		print i
+	for i in asker.themInfo( player ):
+		print i
+
+def printPlayerActions(options, args):
+	game = MafiaGame.load( options['gameid'] )
+
+	if len(args) != 1 or not isUserId(args[0]):
+		errorInvalidArgument()
+	if not args[0] in game.players:
+		errorInvalidArgument('no such player')
+	
+	if game.over: return
+	asker = game.getPlayer( options['uid'] )
+	for i in asker.actionsOn( game.players[args[0]] ):
+		print i
+
+def playerAction(options, args):
+	lock = MafiaGameLock()
+	game = MafiaGame.load( options['gameid'] )
+	if len(args) != 2 or not isUserId(args[0]):
+		errorInvalidArgument()
+	if not args[0] in game.players:
+		errorInvalidArgument('no such player')
+	if game.over: errorInvalidArgument()
+	
+	asker = game.getPlayer( options['uid'] )
+	target = game.players[ args[0] ]
+	asker.action( target, args[1] )
+	game.save( options['gameid'] )
+
+def nextRound(options, args):
+	lock = MafiaGameLock()
+	game = MafiaGame.load( options['gameid'] )
+	game.nextRound()
+	game.save( options['gameid'] )
+
+def printWinner(options, arguments):
+	game = MafiaGame.load( options['gameid'] )
+	if game.over:
+		print game.winner
+
+def printLynchVotes(options, arguments):
+	if len(arguments) != 1: errorInvalidArgument('please supply day as an argument')
+	(day,) = arguments
+	if not isInteger(day): errorInvalidArgument('day number must be an integer!')
+	key = (int(day),0)
+	
+	game = MafiaGame.load( options['gameid'] )
+	if key not in game.rounds:
+		errorInvalidArgument('the requested day / phase have no stored information')
+	votes = game.rounds[key]._LynchMob__votes.votes
+	for i in votes:
+		if votes[i].target != None:
+			print i.name + ' ' + votes[i].target.name
+
+def hack(options, args):
+	lock = MafiaGameLock()
+	game = MafiaGame.load( options['gameid'] )
+	game.playerDied( None )
+	game.save( options['gameid'] )
+
+def printUsage(options, arguments):
+	print """Usage: mafia <command> <options> <arguments>
+  Command should be one of the following:
+   create          Create a new mafia game
+   players         List players in game
+   round           Print the current day, and the phase in the day
+   winner          Print the winning team, or nothing if the game isn't over
+   player_details  Print out everything you know about a player
+   player_actions  Print out everything you can do to a player
+   player_action   Carry out an action on a player
+   lynch_votes     Print out a list of who voted to have whom lynched
+   next_round      Continue to next round of game
+   usage           Prints this message then exits
+
+  The following options are common to all commands:
+   --gameid        The name of the game to play
+   --uid           The user id to play as
+
+  The following options are present for the `create' command only:
+   --mafiamembers  The number of people in each mafia
+   --mafias        The number of mafias
+   --doctors       The number of doctors
+   --detectives    The number of people in each police force
+   --policeforces  The number of police forces
+   --unassigned    The maximum number of roles to not assign"""
+	
+def parseOptions(arglist):
+	commands = { 'create': createGame, 'players': listPlayers, 'round': printRound,
+	             'player_details': printPlayerDetails, 'player_actions': printPlayerActions,
+	             'player_action': playerAction, 'next_round': nextRound, 'usage': printUsage,
+               'winner': printWinner, 'lynch_votes': printLynchVotes, 'hack': hack }
+	
+	options = { 'mode': printUsage, 'uid': '' }
+	
+	if len(arglist) == 0:
+		return options, []
+	
+	command = arglist[0]
+	if command not in commands:
+		errorInvalidArgument("command `%(command)s' not understood" % vars())
+	options['mode'] = commands[command]
+	
+	flags = ['uid=','gameid=']
+	if command == 'create':
+		flags.extend(['mafiamembers=','mafias=','doctors=','detectives=','policeforces=','unassigned='])
+	
+	import getopt
+	try:
+		opts, args = getopt.getopt(arglist[1:], '', flags)
+	except getopt.GetoptError:
+		return options
+	
+	hadErrors = False
+	def invalidArgument(opt, arg, err):
+		errorInvalidArgument("`%(arg)s' given to option `%(opt)s': %(err)s" % vars())
+	
+	for opt, arg in opts:
+		if opt == '--uid':
+			if isUserId(arg):
+				options['uid'] = arg
+			else:
+				invalidArgument(opt, arg, 'not a numeric user id')
+		if opt == '--gameid':
+			if isMafiaId(arg):
+				options['gameid'] = arg
+			else:
+				invalidArgument(opt, arg, 'not a valid game id')
+		if opt in ('--mafias','--mafiamembers','--doctors','--policeforces','--detectives','--unassigned'):
+			if isInteger(arg):
+				options[opt[2:]] = int(arg)
+			else:
+				invalidArgument(opt, arg, 'not an integer')
+	
+	if 'gameid' not in options:
+		errorInvalidArgument("no gameid specified. use the --gameid command-line option.")
+	
+	return options, args
+
+def main():
+	options, args = parseOptions(sys.argv[1:])
+	options['mode'](options, args)
+
+if __name__ == '__main__':
+	main()
